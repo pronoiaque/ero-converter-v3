@@ -1,131 +1,106 @@
-#!/usr/bin/env python3
-"""
-Convertisseur categori_hd.dat -> categories_hd.csv
-Règles strictes :
-- Conservation des entêtes
-- Lecture jusqu'au NULL terminal
-- CODE(4 digits, sans padding) + ESPACE(1) + TEXTE ≤ 30 caractères
-- Réversibilité absolue 100%
-"""
+# ---------------------------------------------------------------------------
+# dat_to_csv_audit_v7.py
+# Extraction et audit du fichier binaire ERO vers CSV.
+# V7 — Détection de BOM résiduel dans l'en-tête.
+# ---------------------------------------------------------------------------
 
+import csv
+import os
 import sys
-from typing import List, Tuple
 
 
-def read_dat_file(filepath: str) -> Tuple[bytes, List[Tuple[str, str]]]:
-    """
-    Lit le fichier .dat et extrait l'en-tête et les enregistrements.
-    
-    Returns:
-        (header_bytes, list of (code, text) tuples)
-    """
-    with open(filepath, 'rb') as f:
-        data = f.read()
-    
-    # Extraire l'en-tête (16 premiers octets)
-    header = data[:16]
-    
-    # Vérifier que l'en-tête commence bien par "ERO\0"
-    if not header.startswith(b'ERO\x00'):
-        raise ValueError("Format d'en-tête invalide - doit commencer par 'ERO\\0'")
-    
-    # Parser les enregistrements
-    records = []
-    pos = 16
-    
-    while pos < len(data):
-        # Trouver le prochain NULL terminal
-        null_pos = data.find(b'\x00', pos)
-        
-        if null_pos == -1:
-            # Pas de NULL trouvé, fin du fichier
-            break
-        
-        # Extraire l'enregistrement complet jusqu'au NULL
-        record_bytes = data[pos:null_pos]
-        
-        # Ignorer les enregistrements trop courts (< 6 caractères pour "CODE T")
-        if len(record_bytes) < 6:
-            pos = null_pos + 1
-            continue
-        
-        # Décoder en ASCII (ignorer les erreurs)
-        try:
-            record_str = record_bytes.decode('ascii', errors='ignore')
-        except:
-            record_str = record_bytes.decode('latin-1', errors='ignore')
-        
-        # Enlever les caractères de padding \xcd au début
-        record_str = record_str.lstrip('\xcc\xcd')
-        
-        # Parser CODE ESPACE TEXTE
-        # Le code doit être sur 4 caractères suivis d'un espace
-        if len(record_str) >= 6:  # Au minimum "0000 X"
-            # Vérifier si les 4 premiers caractères ressemblent à un code
-            potential_code = record_str[:4]
-            
-            # Code valide = 4 digits UNIQUEMENT (pas de lettres)
-            is_valid_code = potential_code.isdigit()
-            
-            # Vérifier qu'il y a un espace après le code
-            has_space = record_str[4:5] == ' '
-            
-            if is_valid_code and has_space:
-                code_str = potential_code
-                text_str = record_str[5:].strip()
-                
-                # Nettoyer le texte (enlever les caractères non imprimables)
-                text_clean = ''.join(c for c in text_str if c.isprintable())
-                
-                # Ajouter uniquement si le texte n'est pas vide
-                if text_clean:
-                    records.append((code_str, text_clean))
-        
-        # Avancer après le NULL
-        pos = null_pos + 1
-    
-    return header, records
+# ===========================================================================
+# CONFIGURATION
+# ===========================================================================
+
+# Résolution de l'entrée : argument CLI > fichier par défaut.
+if len(sys.argv) > 1:
+    INPUT_FILE = sys.argv[1]
+else:
+    INPUT_FILE = "categori_corrected.dat"
+
+OUTPUT_FILE   = "export_audit_v7.csv"
+BLOCK_SIZE    = 31              # Taille fixe d'un enregistrement en octets.
+START_OFFSET  = 52              # Fin de l'en-tête (Header 16 + Buffer 36).
+ENCODING      = "latin-1"       # Encodage du fichier binaire source.
+
+# Signature du BOM UTF-8 — utilisée pour la vérification d'intégrité.
+BOM_UTF8 = b"\xef\xbb\xbf"
 
 
-def write_csv_file(filepath: str, records: List[Tuple[str, str]]) -> None:
-    """
-    Écrit les enregistrements dans un fichier CSV.
-    Format: CODE;TEXTE
-    """
-    with open(filepath, 'w', encoding='utf-8-sig') as f:  # utf-8-sig pour le BOM
-        for code, text in records:
-            # Supprimer les zéros de tête du code (0202 -> 202) si numérique
-            if code.isdigit():
-                code_formatted = f'{int(code):04d}'
-            else:
-                # Garder le code tel quel si non numérique
-                code_formatted = code
-            
-            # Écrire au format CSV
-            f.write(f'{code_formatted};{text}\n')
-
+# ===========================================================================
+# LOGIQUE PRINCIPALE
+# ===========================================================================
 
 def main():
-    """Point d'entrée principal."""
-    if len(sys.argv) != 3:
-        print("Usage: python dat_to_csv.py <input.dat> <output.csv>")
-        sys.exit(1)
-    
-    input_dat = sys.argv[1]
-    output_csv = sys.argv[2]
-    
-    print(f"Lecture de {input_dat}...")
-    header, records = read_dat_file(input_dat)
-    
-    print(f"  En-tête: {header[:16].hex()}")
-    print(f"  Nombre d'enregistrements: {len(records)}")
-    
-    print(f"Écriture vers {output_csv}...")
-    write_csv_file(output_csv, records)
-    
-    print("Conversion terminée avec succès!")
-    print(f"  {len(records)} enregistrements convertis")
+    if not os.path.exists(INPUT_FILE):
+        print(f"Erreur : Fichier '{INPUT_FILE}' introuvable.")
+        return
+
+    print("--- AUDIT BINAIRE ERO ---")
+    print(f"Lecture de : {INPUT_FILE}")
+
+    with open(INPUT_FILE, "rb") as f_in, \
+         open(OUTPUT_FILE, "w", newline="", encoding=ENCODING) as f_out:
+
+        writer = csv.writer(f_out, delimiter=";")
+
+        # --------------------------------------------------------------
+        # Lecture et validation de l'en-tête (52 premiers octets).
+        # --------------------------------------------------------------
+        header = f_in.read(START_OFFSET)
+
+        if len(header) < START_OFFSET:
+            print("Erreur : fichier trop court ou sans en-tête valide.")
+            return
+
+        # Détection de BOM UTF-8 résiduel dans la zone en-tête.
+        # Si présent, le fichier a été corrompu avant la V7.
+        if BOM_UTF8 in header:
+            print("ALERTE CRITIQUE : des octets BOM (EF BB BF) ont été détectés dans l'en-tête !")
+
+        # --------------------------------------------------------------
+        # Lecture séquentielle des blocs de données.
+        # --------------------------------------------------------------
+        count = 0
+
+        while True:
+            block = f_in.read(BLOCK_SIZE)
+
+            # Fin du fichier ou bloc incomplet → on arrête.
+            if not block or len(block) < BLOCK_SIZE:
+                break
+
+            # Extraction du contenu : tout ce qui précède le premier \x00.
+            null_idx = block.find(b"\x00")
+            content_bytes = block[:null_idx] if null_idx != -1 else block
+
+            full_text = content_bytes.decode(ENCODING).strip()
+
+            # Bloc vide après décodage → on passe au suivant.
+            if not full_text:
+                continue
+
+            # ----------------------------------------------------------
+            # Séparation code / texte sur le premier espace.
+            #   "0042 Catégorie X"  →  ["0042", "Catégorie X"]
+            # ----------------------------------------------------------
+            parts = full_text.split(" ", 1)
+
+            if len(parts) == 2:
+                writer.writerow([parts[0], parts[1]])
+            else:
+                writer.writerow([parts[0], ""])
+
+            count += 1
+
+    print("--- TERMINÉ ---")
+    print(f"{count} lignes extraites vers {OUTPUT_FILE}")
 
 
-if __name__ == '__main__':
+# ===========================================================================
+# POINT D'ENTRÉE
+# ===========================================================================
+
+if __name__ == "__main__":
     main()

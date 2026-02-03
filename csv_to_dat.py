@@ -1,134 +1,142 @@
-#!/usr/bin/env python3
-"""
-Convertisseur categories_hd.csv -> categori_hd.dat
-Règles strictes :
-- Conservation des entêtes
-- CODE(4 digits) + ESPACE(1) + TEXTE ≤ 30 caractères total
-- NULL terminal obligatoire
-- Padding \xcd si nécessaire pour atteindre 31 octets
-- Réversibilité absolue 100%
-"""
+# ---------------------------------------------------------------------------
+# csv_to_dat_final_v7.py
+# Génération du fichier binaire ERO à partir d'un CSV.
+# V7 — Élimination automatique du BOM UTF-8 avant traitement.
+# ---------------------------------------------------------------------------
 
+import csv
+import os
 import sys
-from typing import List, Tuple
 
 
-def read_csv_file(filepath: str) -> List[Tuple[str, str]]:
-    """
-    Lit le fichier CSV et extrait les enregistrements.
-    Format attendu: CODE;TEXTE
-    
-    Returns:
-        List of (code, text) tuples
-    """
-    records = []
-    
-    with open(filepath, 'r', encoding='utf-8-sig') as f:  # utf-8-sig pour ignorer le BOM
-        for line_num, line in enumerate(f, 1):
-            line = line.strip()
-            if not line:
-                continue
-            
-            # Parser CODE;TEXTE
-            parts = line.split(';', 1)
-            if len(parts) != 2:
-                print(f"Attention ligne {line_num}: format invalide, ignorée")
-                continue
-            
-            code_str, text = parts
-            
-            # S'assurer que le code est sur 4 digits
-            try:
-                code_int = int(code_str)
-                code_formatted = f'{code_int:04d}'
-            except ValueError:
-                # Code non numérique (ex: "BATIMENT TECHNIQUE")
-                code_formatted = code_str[:4].ljust(4, ' ')
-            
-            # Vérifier la longueur totale (CODE + ESPACE + TEXTE)
-            total_length = len(code_formatted) + 1 + len(text)
-            if total_length > 30:
-                print(f"Attention ligne {line_num}: trop long ({total_length} > 30), texte tronqué")
-                text = text[:30 - 5]  # 30 - (4 code + 1 espace)
-            
-            records.append((code_formatted, text))
-    
-    return records
+# ===========================================================================
+# CONFIGURATION
+# ===========================================================================
+
+# Résolution de l'entrée : argument CLI > fichier par défaut > fallback.
+if len(sys.argv) > 1:
+    INPUT_FILE = sys.argv[1]
+elif os.path.exists("for_gemini.csv"):
+    INPUT_FILE = "for_gemini.csv"
+else:
+    INPUT_FILE = "categories_hd.csv"
+
+OUTPUT_FILE = "categori_corrected.dat"
+BLOCK_SIZE  = 31                # Taille fixe d'un enregistrement en octets.
+
+# Encodages
+CSV_ENCODING = "utf-8-sig"      # Consomme silencieusement le BOM (EF BB BF) s'il est présent.
+DAT_ENCODING = "latin-1"        # Format cible du fichier binaire (legacy ERO).
 
 
-def write_dat_file(filepath: str, records: List[Tuple[str, str]], 
-                   original_header: bytes = None) -> None:
-    """
-    Écrit les enregistrements dans un fichier .dat binaire.
-    
-    Args:
-        filepath: Chemin du fichier de sortie
-        records: Liste des (code, text) tuples
-        original_header: En-tête original à conserver (optionnel)
-    """
-    with open(filepath, 'wb') as f:
-        # Écrire l'en-tête
-        if original_header:
-            f.write(original_header)
-        else:
-            # En-tête par défaut: "ERO\0" + 12 octets de métadonnées
-            default_header = b'ERO\x00\xfd\xfd\xfd\xfd\xdd\xdd\xdd\xdd\x41\x00\x00\x00'
-            f.write(default_header)
-        
-        # Écrire chaque enregistrement
-        for code, text in records:
-            # Construire: CODE + ESPACE + TEXTE + NULL
-            record_str = f'{code} {text}'
-            record_bytes = record_str.encode('ascii', errors='replace')
-            
-            # Écrire les données
-            f.write(record_bytes)
-            
-            # Écrire le NULL terminal
-            f.write(b'\x00')
-            
-            # Calculer le padding nécessaire
-            # Longueur actuelle = len(record_bytes) + 1 (NULL)
-            current_length = len(record_bytes) + 1
-            
-            # Décider si on ajoute du padding
-            # Règle observée: certains enregistrements ont du padding pour atteindre 31 octets
-            # On ajoute du padding si la longueur est < 31 et qu'il y a de la place
-            if current_length < 31:
-                # Ajouter du padding \xcd pour atteindre 31 octets
-                padding_length = 31 - current_length
-                f.write(b'\xcd' * padding_length)
+# ===========================================================================
+# STRUCTURE TECHNIQUE — ZONE EN-TÊTE (52 octets, validée)
+# ===========================================================================
+#
+#   Offset  Taille  Rôle
+#   ------  ------  ------------------------------------
+#    0      16      Header  — Signature ERO
+#   16      36      Buffer  — Séquence technique <vide>
+#   52       —      Début des enregistrements de données
+#
+# ===========================================================================
 
+HEADER_BYTES = bytes.fromhex(
+    "45524F00"          # Signature "ERO\0"
+    "FDFDFDFD"          # Padding signature
+    "DDDDDDDD"         # Padding signature
+    "41000000"          # Terminateur header
+)
+
+BUFFER_BYTES = bytes.fromhex(
+    "41000000"          # Préfixe buffer
+    "00"                # Séparateur
+    "3C766964653E20"    # Chaîne ASCII "<vide> "
+    "CCCCCCCCCCCCCCCC"  # Padding buffer (24 octets
+    "CCCCCCCCCCCCCCCC"  #  de 0xCC)
+    "CCCCCCCCCCCCCCCC"  #
+)
+
+
+# ===========================================================================
+# LOGIQUE PRINCIPALE
+# ===========================================================================
 
 def main():
-    """Point d'entrée principal."""
-    if len(sys.argv) < 3:
-        print("Usage: python csv_to_dat.py <input.csv> <output.dat> [original.dat]")
-        print("  original.dat (optionnel): fichier .dat original pour conserver l'en-tête")
-        sys.exit(1)
-    
-    input_csv = sys.argv[1]
-    output_dat = sys.argv[2]
-    original_dat = sys.argv[3] if len(sys.argv) > 3 else None
-    
-    # Lire l'en-tête original si fourni
-    original_header = None
-    if original_dat:
-        print(f"Lecture de l'en-tête original depuis {original_dat}...")
-        with open(original_dat, 'rb') as f:
-            original_header = f.read(16)
-        print(f"  En-tête: {original_header.hex()}")
-    
-    print(f"Lecture de {input_csv}...")
-    records = read_csv_file(input_csv)
-    print(f"  Nombre d'enregistrements: {len(records)}")
-    
-    print(f"Écriture vers {output_dat}...")
-    write_dat_file(output_dat, records, original_header)
-    
-    print("Conversion terminée avec succès!")
-    print(f"  {len(records)} enregistrements convertis")
+    if not os.path.exists(INPUT_FILE):
+        print(f"ERREUR : Fichier source '{INPUT_FILE}' introuvable.")
+        return
+
+    print("--- GÉNÉRATION DE BINAIRE ERO (V7 - Anti-BOM) ---")
+    print(f"Source : {INPUT_FILE}")
+    print(f"Cible  : {OUTPUT_FILE}")
+
+    # ------------------------------------------------------------------
+    # Ouverture du CSV avec gestion automatique du BOM.
+    # utf-8-sig est la clé : les 3 octets EF BB BF sont absorbés
+    # silencieusement si présents.  En cas d'échec, fallback latin-1.
+    # ------------------------------------------------------------------
+    try:
+        f_in = open(INPUT_FILE, "r", newline="", encoding=CSV_ENCODING)
+    except UnicodeDecodeError:
+        print("Avertissement : échec lecture UTF-8, tentative en Latin-1...")
+        f_in = open(INPUT_FILE, "r", newline="", encoding="latin-1")
+
+    with f_in, open(OUTPUT_FILE, "wb") as f_out:
+        reader = csv.reader(f_in, delimiter=";")
+
+        # --------------------------------------------------------------
+        # Injection de la structure en-tête (offsets 0–52).
+        # --------------------------------------------------------------
+        f_out.write(HEADER_BYTES)
+        f_out.write(BUFFER_BYTES)
+
+        count = 0
+
+        for row in reader:
+            if not row or len(row) < 2:
+                continue
+
+            # ----------------------------------------------------------
+            # Nettoyage des champs bruts (espaces parasites).
+            # ----------------------------------------------------------
+            code_brut  = row[0].strip()
+            texte_brut = row[1].strip()
+
+            # Concaténation : "code texte"
+            full_string = f"{code_brut} {texte_brut}"
+
+            # ----------------------------------------------------------
+            # Construction du bloc de 31 octets
+            #   [payload … \x00 … padding 0xCD]
+            #
+            #   payload  : contenu encodé en latin-1, max 30 octets.
+            #   \x00     : terminateur de chaîne (1 octet).
+            #   padding  : remplissage avec 0xCD jusqu'à 31 octets.
+            # ----------------------------------------------------------
+            max_content_len = BLOCK_SIZE - 1  # 30 octets utiles max
+
+            payload = full_string.encode(DAT_ENCODING, errors="replace")[:max_content_len]
+
+            padding_len = BLOCK_SIZE - len(payload) - 1
+            padding     = b"\xCD" * padding_len if padding_len > 0 else b""
+
+            final_block = payload + b"\x00" + padding
+
+            # Sécurité : garantie de la taille exacte.
+            if len(final_block) != BLOCK_SIZE:
+                final_block = final_block[:BLOCK_SIZE]
+
+            f_out.write(final_block)
+            count += 1
+
+    print("--- SUCCÈS ---")
+    print(f"{count} enregistrements écrits sans BOM parasite.")
 
 
-if __name__ == '__main__':
+# ===========================================================================
+# POINT D'ENTRÉE
+# ===========================================================================
+
+if __name__ == "__main__":
     main()
